@@ -42,8 +42,26 @@ void visualize(struct Ball balls[], struct Params *params, double t0, double tic
 		double dx[params->n];
 		double dy[params->n];
 		for(int i=0; i<params->n; i++){
-			dx[i] = movement_integral(balls[i].v_x, params->mu, t0+mi*delta_t-balls[i].tick_base, t0-balls[i].tick_base);
-			dy[i] = movement_integral(balls[i].v_y, params->mu, t0+mi*delta_t-balls[i].tick_base, t0-balls[i].tick_base);
+			double v_x, v_y;
+			double mu_x, mu_y;
+			if(params->motion_mode == UNIFORMLY_DECELERATED){
+				double sin_a = sinus(balls[i].v_x, balls[i].v_y);
+				double cos_a = cosinus(balls[i].v_x, balls[i].v_y);
+				mu_x = params->mu*cos_a;
+				mu_y = params->mu*sin_a;
+				v_x = balls[i].v_x - params->mu*cos_a*(t0 - balls[i].tick_base);
+				v_y = balls[i].v_y - params->mu*sin_a*(t0 - balls[i].tick_base);
+				//printf("%lf - %lf\n", balls[i].v_x - params->mu*cos_a*(tick - balls[i].tick_base));
+			}
+			else{
+				mu_x = params->mu;
+				mu_y = params->mu;
+				v_x = balls[i].v_x;
+				v_y = balls[i].v_y;
+			}
+			dx[i] = movement_integral(v_x, mu_x, t0+mi*delta_t-balls[i].tick_base, t0-balls[i].tick_base, params->motion_mode);
+			dy[i] = movement_integral(v_y, mu_y, t0+mi*delta_t-balls[i].tick_base, t0-balls[i].tick_base, params->motion_mode);
+			//printf("%lf\n", dx[i]);
 			balls[i].x += dx[i];
 			balls[i].y += dy[i];
 		}
@@ -73,13 +91,14 @@ int main() {
 	params->bottom_border = (params->height + params->b) / 2;
 	params->right_border = (params->width + params->a) / 2;
 	params->left_border = (params->width - params->a) / 2;
-	params->mu = 0.0002;
-	params->n = 2;
+	params->mu = 0.00018;
+	params->n = 7;
 	params->l = 60.0;
 	params->k = 1;
 	params->delta_t = 0.001;
-	params->v_max = 0.4*sqrt(2);
-
+	params->v_max = 1*sqrt(2);
+	//params->motion_mode = PROPORTIONAL_TO_VELOCITY;
+	params->motion_mode = UNIFORMLY_DECELERATED;
 	display = al_create_display(params->width, params->height);
 	
 	struct Ball balls[params->n];
@@ -94,16 +113,19 @@ int main() {
 	FILE * fp;
 	fp = fopen ("distribution.txt","w");
 
-	//balls_init(balls, params);
-	balls_init_from_file(balls, params);
-	
+	balls_init(balls, params);
+	//balls_init_from_file(balls, params);
 	while (running) {
 		tick_counter++;
         draw_table(balls, params);
 
 		enum State state = GAME_ON;
-		tick += shortcut_step(balls, params, tick, &state) * params->delta_t;
-		printf("tick = %lf\n", tick);
+		int putting_out_id = -1;
+		tick += shortcut_step(balls, params, tick, &state, &putting_out_id) * params->delta_t;
+		if(params->motion_mode == UNIFORMLY_DECELERATED && putting_out_id != -1){
+			tick += ud_putting_out(balls, params, putting_out_id, tick);
+			continue;
+		}
 		if(isnan(tick)) state = check_table(balls, params, tick);
 		if(state == BALL_BEYOND_TABLE && running){
 			printf("BALL_BEYOND_TABLE\n");
@@ -113,12 +135,12 @@ int main() {
 			printf("LACK_OF_ENERGY\n");
 			running = false;
 		}
-		mechanics_step(balls, params, tick, &n_count, &d_count);
-		if(all_balls_in_move(balls, params->n)) write_velocity_distribution(fp, balls, params->n, &write_counter);
-		
-		tick += params->delta_t;
+		if(running){
+			mechanics_step(balls, params, tick, &n_count, &d_count);
+			//if(all_balls_in_move(balls, params->n)) write_velocity_distribution(fp, balls, params->n, &write_counter);
+			tick += params->delta_t;
+		}
 		draw_table(balls, params);
-		//printf("\n");
 	}
 
 	al_destroy_display(display);
