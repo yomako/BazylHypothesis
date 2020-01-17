@@ -24,7 +24,12 @@ void kernel(struct Params *params, int *result){
 	
 	while (running) {
 		tick_counter++;
-		tick += shortcut_step(balls, params, tick, &state) * params->delta_t;
+		int putting_out_id = -1;
+		tick += shortcut_step(balls, params, tick, &state, &putting_out_id) * params->delta_t;
+		if(params->motion_mode == UNIFORMLY_DECELERATED && putting_out_id != -1){
+			tick += ud_putting_out(balls, params, putting_out_id, tick);
+			continue;
+		}
 		if(isnan(tick)) state = check_table(balls, params, tick);
 		if(state == BALL_BEYOND_TABLE && running){
 			running = false;
@@ -67,6 +72,8 @@ int main() {
 	params->k = 1;
 	params->delta_t = 0.001;
 	params->v_max = 0.4*sqrt(2);
+	params->motion_mode = PROPORTIONAL_TO_VELOCITY;
+	//params->motion_mode = UNIFORMLY_DECELERATED;
 
 	for(int i=0; i<REPEATS; i++){
 		kernel(params, results);
