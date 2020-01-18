@@ -6,7 +6,10 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <stdbool.h>
+#include <cuComplex.h>
 
+
+typedef enum {PROPORTIONAL_TO_VELOCITY, UNIFORMLY_DECELERATED} Motion_mode;
 
 struct Ball
 {	
@@ -41,10 +44,155 @@ struct Params
 	double delta_t;
 	double v_max;
 	double R;
+	Motion_mode motion_mode;
 };
 
 enum State {BALL_BEYOND_TABLE, LACK_OF_ENERGY, GAME_ON, ERROR};
 enum Return_mode {POCKET, CORNER, BORDER, COLLISION};
+
+__device__ unsigned int solveP3(double *x, double a, double b, double c) {
+	double PI = 3.141592653589793238463L;
+	double eps=1e-12;
+	double M_2PI = 2*PI;
+	double a2 = a*a;
+    double q  = (a2 - 3*b)/9;
+	double r  = (a*(2*a2-9*b) + 27*c)/54;
+    double r2 = r*r;
+	double q3 = q*q*q;
+	double A,B;
+    	if(r2<q3) 
+    	{
+    		double t=r/sqrt(q3);
+    		if( t<-1) t=-1;
+    		if( t> 1) t= 1;
+    		t=acos(t);
+    		a/=3; q=-2*sqrt(q);
+    		x[0]=q*cos(t/3)-a;
+    		x[1]=q*cos((t+M_2PI)/3)-a;
+    		x[2]=q*cos((t-M_2PI)/3)-a;
+    		return 3;
+    	} 
+    	else 
+    	{
+    		A =-pow(fabs(r)+sqrt(r2-q3),1./3);
+    		if( r<0 ) A=-A;
+    		B = (0==A ? 0 : q/A);
+          
+		a/=3;
+		x[0] =(A+B)-a;
+		x[1] =-0.5*(A+B)-a;
+		x[2] = 0.5*sqrt(3.)*(A-B);
+		if(fabs(x[2])<eps) { x[2]=x[1]; return 2; }
+		
+		return 1;
+        }
+}
+
+//---------------------------------------------------------------------------
+// returns roots of quartic polynomial x^4 + a*x^3 + b*x^2 + c*x + d
+__device__ double solve_quartic(double a, double b, double c, double d)
+{
+	double eps=1e-12;
+	double a3 = -b;
+	double b3 =  a*c -4.*d;
+	double c3 = -a*a*d - c*c + 4.*b*d;
+
+	// cubic resolvent
+	// y^3 − b*y^2 + (ac−4d)*y − a^2*d−c^2+4*b*d = 0
+	
+	double x3[3];
+	unsigned int iZeroes = solveP3(x3, a3, b3, c3);
+	
+	double q1, q2, p1, p2, D, sqD, y;
+
+	y = x3[0];
+	// The essence - choosing Y with maximal absolute value.
+	if(iZeroes != 1)
+	{
+		if(fabs(x3[1]) > fabs(y)) y = x3[1];
+		if(fabs(x3[2]) > fabs(y)) y = x3[2];
+	}
+
+	// h1+h2 = y && h1*h2 = d  <=>  h^2 -y*h + d = 0    (h === q)
+
+	D = y*y - 4*d;
+	if(fabs(D) < eps) //in other words - D==0
+	{
+		q1 = q2 = y * 0.5;
+		// g1+g2 = a && g1+g2 = b-y   <=>   g^2 - a*g + b-y = 0    (p === g)
+		D = a*a - 4*(b-y);
+		if(fabs(D) < eps) //in other words - D==0
+			p1 = p2 = a * 0.5;
+
+		else
+		{
+			sqD = sqrt(D);
+			p1 = (a + sqD) * 0.5;
+			p2 = (a - sqD) * 0.5;
+		}
+	}
+	else
+	{
+		sqD = sqrt(D);
+		q1 = (y + sqD) * 0.5;
+		q2 = (y - sqD) * 0.5;
+		// g1+g2 = a && g1*h2 + g2*h1 = c       ( && g === p )  Krammer
+		p1 = (a*q1-c)/(q1-q2);
+		p2 = (c-a*q2)/(q1-q2);
+	}
+
+	cuDoubleComplex retval[4];
+
+	// solving quadratic eq. - x^2 + p1*x + q1 = 0
+	D = p1*p1 - 4*q1;
+	if(D < 0.0)
+	{
+		retval[0] = make_cuDoubleComplex(-p1 * 0.5, sqrt(-D) * 0.5);
+		retval[1] = cuConj(retval[0]);
+	}
+	else
+	{
+		sqD = sqrt(D);
+		retval[0] = make_cuDoubleComplex((-p1 + sqD) * 0.5, 0);
+		retval[1] = make_cuDoubleComplex((-p1 - sqD) * 0.5, 0);
+	}
+	D = p2*p2 - 4*q2;
+	if(D < 0.0)
+	{
+		retval[2] = make_cuDoubleComplex(-p2 * 0.5, sqrt(-D) * 0.5);
+		retval[3] = cuConj(retval[2]);
+	}
+	else
+	{
+		sqD = sqrt(D);
+		retval[2] = make_cuDoubleComplex((-p2 + sqD) * 0.5, 0);
+		retval[3] = make_cuDoubleComplex((-p2 - sqD) * 0.5, 0);
+	}
+    double real_solution;
+    if(cuCimag(retval[3]) != 0.0) real_solution = nan("1");
+    else real_solution = (double)cuCreal(retval[3]);
+    return real_solution;
+}
+
+//---------------------------------------------------------------------------
+// returns roots of quadratic polynomial ax^2 + bx + c
+__device__ double solve_quadratic(double a, double b, double c){
+	double delta = b*b - 4*a*c;
+	double x1 = (-b + sqrt(delta))/2/a;
+	double x2 = (-b - sqrt(delta))/2/a;
+	if(x1 < x2) return x1;
+	else return x2;
+}
+
+__device__ double sinus(double x, double y){
+	if(x == 0 && y == 0) return 0;
+	else return y / sqrt(x*x + y*y);
+}
+
+__device__ double cosinus(double x, double y){
+	if(x == 0 && y == 0) return 0;
+	else return x / sqrt(x*x + y*y);
+}
 
 void shuffle(int *a, int *b){
 	int temp = *a;
@@ -82,86 +230,174 @@ void balls_init(struct Ball *balls, struct Params *params){
 	}
 }
 
-__device__ double movement_integral(double v_0, double mu, double upper_limes, double lower_limes){
-	if(mu == 0.0) return v_0 * (upper_limes - lower_limes);
-	else return v_0/mu*(exp(-mu*lower_limes) - exp(-mu*upper_limes));
+__device__ double movement_integral(double v_0, double mu, double upper_limes, double lower_limes, Motion_mode motion_mode){
+	if(motion_mode == UNIFORMLY_DECELERATED){
+		return v_0*(upper_limes - lower_limes) - mu/2*(upper_limes - lower_limes)*(upper_limes - lower_limes);
+	}
+	if(motion_mode == PROPORTIONAL_TO_VELOCITY){
+		if(mu == 0.0) return v_0 * (upper_limes - lower_limes);
+		else return v_0/mu*(exp(-mu*lower_limes) - exp(-mu*upper_limes));
+	}
 }
 
 __device__ void horizontal_return(struct Ball *ball_j, struct Params *params, double border, double tick){
 	double c;
-	if(params->mu == 0.0) c = (border-ball_j->y_0) / ball_j->v_y; 
-	else c = 1/params->mu * log(1/(1-params->mu*(border-ball_j->y_0)/(ball_j->v_y)*exp(params->mu*(tick-ball_j->tick_base))));
+	double v_x, v_y;
+	double mu_x, mu_y;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+		double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+		v_x = ball_j->v_x-cos_a*params->mu*cos_a*(tick - ball_j->tick_base);
+		v_y = ball_j->v_y-sin_a*params->mu*sin_a*(tick - ball_j->tick_base);
+		c = solve_quadratic(-params->mu*sin_a/2, v_y, ball_j->y_0 - border);
+		mu_x = params->mu * cos_a;
+		mu_y = params->mu * sin_a;
+	}
+	if(params->motion_mode == PROPORTIONAL_TO_VELOCITY){
+		if(params->mu == 0.0) c = (border-ball_j->y_0) / ball_j->v_y; 
+		else c = 1/params->mu * log(1/(1-params->mu*(border-ball_j->y_0)/(ball_j->v_y)*exp(params->mu*(tick-ball_j->tick_base))));
+		v_x = ball_j->v_x;
+		v_y = ball_j->v_y;
+		mu_x = params->mu;
+		mu_y = params->mu;
+	}
 	if(c < 0) return;
-	double x_z = ball_j->x_0 + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
+	double x_z = ball_j->x_0 + movement_integral(v_x, mu_x, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
 	if(x_z > (params->left_border + params->l/sqrt(2.0)) && x_z < (params->right_border - params->l/sqrt(2.0))){
-		ball_j->y = ball_j->y_0 + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
+		ball_j->y = ball_j->y_0 + movement_integral(v_y, mu_y, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
 		ball_j->v_y *= -1;
-		ball_j->y = ball_j->y + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base+c);
-		ball_j->x = ball_j->x_0 + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base);
+		v_y *= -1;
+		if(params->motion_mode == UNIFORMLY_DECELERATED) mu_y *= -1;
+		ball_j->y = ball_j->y + movement_integral(v_y, mu_y, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base+c, params->motion_mode);
+		ball_j->x = ball_j->x_0 + movement_integral(v_x, mu_x, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base, params->motion_mode);
 	}
 	else{
-		ball_j->y = ball_j->y_0 + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base);
-		ball_j->x = ball_j->x_0 + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base);
+		ball_j->y = ball_j->y_0 + movement_integral(v_y, mu_y, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base, params->motion_mode);
+		ball_j->x = ball_j->x_0 + movement_integral(v_x, mu_x, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base, params->motion_mode);
 	}
 }
 
 __device__ void vertical_return(struct Ball *ball_j, struct Params *params, double border, double tick){
 	double c;
-	if(params->mu == 0.0) c = (border-ball_j->x_0) / ball_j->v_x; 
-	else c = 1/params->mu * log(1/(1-params->mu*(border-ball_j->x_0)/ball_j->v_x*exp(params->mu*(tick-ball_j->tick_base))));
+	double v_x, v_y;
+	double mu_x, mu_y;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+		double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+		v_x = ball_j->v_x-cos_a*params->mu*cos_a*(tick - ball_j->tick_base);
+		v_y = ball_j->v_y-sin_a*params->mu*sin_a*(tick - ball_j->tick_base);
+		c = solve_quadratic(-params->mu*cos_a/2, v_x, ball_j->x_0 - border);
+		mu_x = params->mu * cos_a;
+		mu_y = params->mu * sin_a;
+	}
+	if(params->motion_mode == PROPORTIONAL_TO_VELOCITY){
+		if(params->mu == 0.0) c = (border-ball_j->x_0) / ball_j->v_x; 
+		else c = 1/params->mu * log(1/(1-params->mu*(border-ball_j->x_0)/ball_j->v_x*exp(params->mu*(tick-ball_j->tick_base))));
+		v_x = ball_j->v_x;
+		v_y = ball_j->v_y;
+		mu_x = params->mu;
+		mu_y = params->mu;
+	}
 	if(c < 0) return;
-	double y_z = ball_j->y_0 + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
+	double y_z = ball_j->y_0 + movement_integral(v_y, mu_y, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
 	if(y_z > (params->top_border + params->l/sqrt(2.0)) && y_z < (params->bottom_border - params->l/sqrt(2.0))){
-		ball_j->x = ball_j->x_0 + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
+		ball_j->x = ball_j->x_0 + movement_integral(v_x, mu_x, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
 		ball_j->v_x *= -1;
-		ball_j->y = ball_j->y_0 + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base);
-		ball_j->x = ball_j->x + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base+c);
+		v_x *= -1;
+		if(params->motion_mode == UNIFORMLY_DECELERATED) mu_x *= -1;
+		ball_j->y = ball_j->y_0 + movement_integral(v_y, mu_y, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base, params->motion_mode);
+		ball_j->x = ball_j->x + movement_integral(v_x, mu_x, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base+c, params->motion_mode);
 	}
 	else{
-		ball_j->y = ball_j->y_0 + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base);
-		ball_j->x = ball_j->x_0 + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base);
+		ball_j->y = ball_j->y_0 + movement_integral(v_y, mu_y, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base, params->motion_mode);
+		ball_j->x = ball_j->x_0 + movement_integral(v_x, mu_x, tick-ball_j->tick_base+params->delta_t, tick-ball_j->tick_base, params->motion_mode);
 	}
 }
 
 __device__ void corner_return(struct Ball *ball_j, struct Params *params, double tick){
 	double c;
-	if(params->mu == 0.0){
+	double v_x, v_y;
+	double mu_x, mu_y;
+	double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+	double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
 		double x_p = ball_j->x_0 - ball_j->x_corner;
 		double y_p = ball_j->y_0 - ball_j->y_corner;
-		double A = ball_j->v_x*ball_j->v_x + ball_j->v_y*ball_j->v_y;
-		double B = 2*(ball_j->v_x*x_p + ball_j->v_y*y_p);
-		double C = x_p*x_p + y_p*y_p - params->R*params->R;
-		double delta = B*B - 4*A*C;
-		if(delta < 0) return;
-		c = (-B - sqrt(delta))/2/A;
+		mu_x = params->mu * cos_a;
+		mu_y = params->mu * sin_a;
+		v_x = ball_j->v_x - params->mu*cos_a*(tick - ball_j->tick_base);
+		v_y = ball_j->v_y - params->mu*sin_a*(tick - ball_j->tick_base);
+		double A = params->mu*params->mu/4;
+		double B = -params->mu*(v_x*cos_a + v_y*sin_a);
+		double C = v_x*v_x + v_y*v_y - params->mu * (x_p*cos_a + y_p*sin_a);
+		double D = 2*(x_p*v_x + y_p*v_y);
+		double E = x_p*x_p + y_p*y_p - params->R*params->R;
+		B /= A;
+		C /= A;
+		D /= A;
+		E /= A;
+		c = solve_quartic(B, C, D, E);
 	}
 	else{
-		double v_x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
-		double v_y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
-		double x_p = ball_j->x_0 + v_x/params->mu - ball_j->x_corner;
-		double y_p = ball_j->y_0 + v_y/params->mu - ball_j->y_corner;
-		double A = (v_x*v_x + v_y*v_y)/params->mu/params->mu;
-		double B = -2*(x_p*v_x + y_p*v_y)/params->mu;
-		double C = x_p*x_p + y_p*y_p - params->R*params->R;
-		double delta = B*B - 4*A*C;
-		if(delta < 0) return;
-		double g = (-B + sqrt(delta)) / 2 / A;
-		c = -1/params->mu*log(g);
+		if(params->mu == 0.0){
+			double x_p = ball_j->x_0 - ball_j->x_corner;
+			double y_p = ball_j->y_0 - ball_j->y_corner;
+			double A = ball_j->v_x*ball_j->v_x + ball_j->v_y*ball_j->v_y;
+			double B = 2*(ball_j->v_x*x_p + ball_j->v_y*y_p);
+			double C = x_p*x_p + y_p*y_p - params->R*params->R;
+			double delta = B*B - 4*A*C;
+			if(delta < 0) return;
+			c = (-B - sqrt(delta))/2/A;
+		}
+		else{
+			double v_x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
+			double v_y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
+			double x_p = ball_j->x_0 + v_x/params->mu - ball_j->x_corner;
+			double y_p = ball_j->y_0 + v_y/params->mu - ball_j->y_corner;
+			double A = (v_x*v_x + v_y*v_y)/params->mu/params->mu;
+			double B = -2*(x_p*v_x + y_p*v_y)/params->mu;
+			double C = x_p*x_p + y_p*y_p - params->R*params->R;
+			double delta = B*B - 4*A*C;
+			if(delta < 0) return;
+			double g = (-B + sqrt(delta)) / 2 / A;
+			c = -1/params->mu*log(g);
+		}
+		mu_x = params->mu;
+		mu_y = params->mu;
+		v_x = ball_j->v_x;
+		v_y = ball_j->v_y;
 	}
-	ball_j->x = ball_j->x_0 + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
-	ball_j->y = ball_j->y_0 + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
-	double v_xp = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base + c));
-	double v_yp = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base + c));
+	ball_j->x = ball_j->x_0 + movement_integral(v_x, mu_x, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
+	ball_j->y = ball_j->y_0 + movement_integral(v_y, mu_y, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
+	double v_xp, v_yp;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		v_xp = ball_j->v_x - cos_a*params->mu*(c + tick - ball_j->tick_base);
+		v_yp = ball_j->v_y - sin_a*params->mu*(c + tick - ball_j->tick_base);
+	}
+	else{
+		v_xp = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base + c));
+		v_yp = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base + c));
+	}
 	double v = sqrt(v_xp*v_xp+v_yp*v_yp);
 	double alpha = acos((ball_j->x_corner - ball_j->x)/params->R);
+	if((ball_j->y_corner - ball_j->y)/params->R < 0) alpha = 2*M_PI - alpha;
 	double beta = acos(v_xp/v);
+	if(v_yp/v < 0) beta = 2*M_PI - beta;
 	double vq = v * cos(beta - alpha);
 	double vp = v * sin(beta - alpha);
 	ball_j->v_x = vq * cos(alpha + M_PI) + vp * cos(alpha + M_PI/2);
 	ball_j->v_y = vq * sin(alpha + M_PI) + vp * sin(alpha + M_PI/2);
 	ball_j->tick_base = tick + c;
-	ball_j->x += movement_integral(ball_j->v_x, params->mu, params->delta_t-c, 0);
-	ball_j->y += movement_integral(ball_j->v_y, params->mu, params->delta_t-c, 0);
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+		double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+		mu_x = params->mu * cos_a;
+		mu_y = params->mu * sin_a;	
+	}
+	v_x = ball_j->v_x;
+	v_y = ball_j->v_y;
+	ball_j->x += movement_integral(v_x, mu_x, params->delta_t-c, 0, params->motion_mode);
+	ball_j->y += movement_integral(v_y, mu_y, params->delta_t-c, 0, params->motion_mode);
 }
 
 __device__ void collision(struct Ball *ball_j, struct Ball *ball_k, struct Params *params, double tick){
@@ -173,29 +409,73 @@ __device__ void collision(struct Ball *ball_j, struct Ball *ball_k, struct Param
 	double x_0dr = ball_j->x_0 - ball_k->x_0;
 	double y_0dr = ball_j->y_0 - ball_k->y_0;
 	// 2)
-	double v_oxdr = ball_j->v_x*exp(-mu*(tick-ball_j->tick_base)) - ball_k->v_x*exp(-mu*(tick-ball_k->tick_base));
-	double v_oydr = ball_j->v_y*exp(-mu*(tick-ball_j->tick_base)) - ball_k->v_y*exp(-mu*(tick-ball_k->tick_base));
-	// 3)
-	double gamma = v_oxdr*v_oxdr + v_oydr*v_oydr;
-	double beta = 2*(v_oxdr*x_0dr+v_oydr*y_0dr);
-	double alpha = x_0dr*x_0dr + y_0dr*y_0dr - 4*R*R;
-	// 4)
-	double sqrt_delta = sqrt(beta*beta - 4*gamma*alpha);
-	// 5)
+	double v_oxdr, v_oydr;
+	double v_xj, v_xk, v_yj, v_yk;
+	double mu_xj, mu_xk, mu_yj, mu_yk;
+	double sin_a, cos_a, sin_b, cos_b;
 	double c;
-	if(mu == 0.0){
-		c = -(beta + sqrt_delta) / 2 / gamma;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+		sin_a = sinus(ball_j->v_x, ball_j->v_y);
+		cos_b = cosinus(ball_k->v_x, ball_k->v_y);
+		sin_b = sinus(ball_k->v_x, ball_k->v_y);
+		v_xj = ball_j->v_x - cos_a*params->mu*(tick - ball_j->tick_base);
+		v_xk = ball_k->v_x - cos_b*params->mu*(tick - ball_k->tick_base);
+		v_yj = ball_j->v_y - sin_a*params->mu*(tick - ball_j->tick_base);
+		v_yk = ball_k->v_y - sin_b*params->mu*(tick - ball_k->tick_base);
+		v_oxdr = ball_j->v_x - cos_a*params->mu*(tick - ball_j->tick_base) - ball_k->v_x + cos_b*params->mu*(tick - ball_k->tick_base);
+		v_oydr = ball_j->v_y - sin_a*params->mu*(tick - ball_j->tick_base) - ball_k->v_y + sin_b*params->mu*(tick - ball_k->tick_base);
+		mu_xj = params->mu*cos_a;
+		mu_xk = params->mu*cos_b;
+		mu_yj = params->mu*sin_a;
+		mu_yk = params->mu*sin_b;
+
+		double u_dx = params->mu/2*(cos_b - cos_a);
+		double u_dy = params->mu/2*(sin_b - sin_a);
+		double A = u_dx*u_dx + u_dy*u_dy;
+		double B = 2*(u_dx*v_oxdr + u_dy*v_oydr);
+		double C = v_oxdr*v_oxdr + v_oydr*v_oydr + 2*u_dx*x_0dr + 2*u_dy*y_0dr;
+		double D = 2*(x_0dr*v_oxdr + y_0dr*v_oydr);
+		double E = x_0dr*x_0dr + y_0dr*y_0dr - 4*params->R*params->R;
+		B /= A;
+		C /= A;
+		D /= A;
+		E /= A;
+		c = solve_quartic(B, C, D, E);
 	}
 	else{
-		double w = -(beta + sqrt_delta) / 2 / gamma;
-		c = log(1/(1-mu*w)) / mu;
+		v_xj = ball_j->v_x;
+		v_xk = ball_k->v_x;
+		v_yj = ball_j->v_y;
+		v_yk = ball_k->v_y;
+		v_oxdr = ball_j->v_x*exp(-mu*(tick-ball_j->tick_base)) - ball_k->v_x*exp(-mu*(tick-ball_k->tick_base));
+		v_oydr = ball_j->v_y*exp(-mu*(tick-ball_j->tick_base)) - ball_k->v_y*exp(-mu*(tick-ball_k->tick_base));
+		mu_xj = params->mu;
+		mu_xk = params->mu;
+		mu_yj = params->mu;
+		mu_yk = params->mu;
+		double gamma = v_oxdr*v_oxdr + v_oydr*v_oydr;
+		double beta = 2*(v_oxdr*x_0dr+v_oydr*y_0dr);
+		double alpha = x_0dr*x_0dr + y_0dr*y_0dr - 4*R*R;
+		// 4)
+		double sqrt_delta = sqrt(beta*beta - 4*gamma*alpha);
+		// 5)
+		if(mu == 0.0){
+			c = -(beta + sqrt_delta) / 2 / gamma;
+		}
+		else{
+			double w = -(beta + sqrt_delta) / 2 / gamma;
+			c = log(1/(1-mu*w)) / mu;
+		}
 	}
+	// 3)
+	
 	// 7)
 
-	double delta_x_cdj = movement_integral(ball_j->v_x, mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
-	double delta_y_cdj = movement_integral(ball_j->v_y, mu, tick-ball_j->tick_base+c, tick-ball_j->tick_base);
-	double delta_x_cdk = movement_integral(ball_k->v_x, mu, tick-ball_k->tick_base+c, tick-ball_k->tick_base);
-	double delta_y_cdk = movement_integral(ball_k->v_y, mu, tick-ball_k->tick_base+c, tick-ball_k->tick_base);
+	double delta_x_cdj = movement_integral(v_xj, mu_xj, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
+	double delta_y_cdj = movement_integral(v_yj, mu_yj, tick-ball_j->tick_base+c, tick-ball_j->tick_base, params->motion_mode);
+	double delta_x_cdk = movement_integral(v_xk, mu_xk, tick-ball_k->tick_base+c, tick-ball_k->tick_base, params->motion_mode);
+	double delta_y_cdk = movement_integral(v_yk, mu_yk, tick-ball_k->tick_base+c, tick-ball_k->tick_base, params->motion_mode);
 	// 8)
 	double xdj = ball_j->x_0 + delta_x_cdj;
 	double ydj = ball_j->y_0 + delta_y_cdj;
@@ -205,10 +485,19 @@ __device__ void collision(struct Ball *ball_j, struct Ball *ball_k, struct Param
 	double sin_phi = (xdk - xdj) / sqrt((xdk - xdj)*(xdk - xdj) + (ydk - ydj)*(ydk - ydj));
 	double cos_phi = (ydj - ydk) / sqrt((xdk - xdj)*(xdk - xdj) + (ydk - ydj)*(ydk - ydj));
 
-	double v_psidj = (ball_j->v_x*cos_phi + ball_j->v_y*sin_phi)*exp(-mu*(tick-ball_j->tick_base+c));
-	double v_etadj = (ball_j->v_y*cos_phi - ball_j->v_x*sin_phi)*exp(-mu*(tick-ball_j->tick_base+c));
-	double v_psidk = (ball_k->v_x*cos_phi + ball_k->v_y*sin_phi)*exp(-mu*(tick-ball_k->tick_base+c));
-	double v_etadk = (ball_k->v_y*cos_phi - ball_k->v_x*sin_phi)*exp(-mu*(tick-ball_k->tick_base+c));
+	double v_psidj, v_etadj, v_psidk, v_etadk;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		v_psidj = (v_xj - mu_xj*c)*cos_phi + (v_yj - mu_yj*c)*sin_phi;
+		v_etadj = (v_yj - mu_yj*c)*cos_phi - (v_xj - mu_xj*c)*sin_phi;
+		v_psidk = (v_xk - mu_xk*c)*cos_phi + (v_yk - mu_yk*c)*sin_phi;
+		v_etadk = (v_yk - mu_yk*c)*cos_phi - (v_xk - mu_xk*c)*sin_phi;
+	}
+	else{
+		v_psidj = (ball_j->v_x*cos_phi + ball_j->v_y*sin_phi)*exp(-mu*(tick-ball_j->tick_base+c));
+		v_etadj = (ball_j->v_y*cos_phi - ball_j->v_x*sin_phi)*exp(-mu*(tick-ball_j->tick_base+c));
+		v_psidk = (ball_k->v_x*cos_phi + ball_k->v_y*sin_phi)*exp(-mu*(tick-ball_k->tick_base+c));
+		v_etadk = (ball_k->v_y*cos_phi - ball_k->v_x*sin_phi)*exp(-mu*(tick-ball_k->tick_base+c));
+	}
 	////////////////////////////////////////
 	double w_etadj = (1-k)/2*v_etadj+(k+1)/2*v_etadk;
 	double w_etadk = (k+1)/2*v_etadj+(1-k)/2*v_etadk;
@@ -234,23 +523,49 @@ __device__ void collision(struct Ball *ball_j, struct Ball *ball_k, struct Param
 		cos_thetadk = ball_k->v_x / sqrt(ball_k->v_x*ball_k->v_x + ball_k->v_y*ball_k->v_y);
 	}
 
-	double w_psidj = sqrt(ball_j->v_x*ball_j->v_x + ball_j->v_y*ball_j->v_y)*exp(-mu*(tick-ball_j->tick_base+c))*(sin_thetadj*sin_phi+cos_phi*cos_thetadj);
-	double w_psidk = sqrt(ball_k->v_x*ball_k->v_x + ball_k->v_y*ball_k->v_y)*exp(-mu*(tick-ball_k->tick_base+c))*(sin_thetadk*sin_phi+cos_phi*cos_thetadk);
-
+	double w_psidj, w_psidk;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		w_psidj = sqrt((v_xj - mu_xj*c)*(v_xj - mu_xj*c) + (v_yj - mu_yj*c)*(v_yj - mu_yj*c))*(sin_thetadj*sin_phi+cos_phi*cos_thetadj);
+		w_psidk = sqrt((v_xk - mu_xk*c)*(v_xk - mu_xk*c) + (v_yk - mu_yk*c)*(v_yk - mu_yk*c))*(sin_thetadk*sin_phi+cos_phi*cos_thetadk);
+	}
+	else{
+		w_psidj = sqrt(ball_j->v_x*ball_j->v_x + ball_j->v_y*ball_j->v_y)*exp(-mu*(tick-ball_j->tick_base+c))*(sin_thetadj*sin_phi+cos_phi*cos_thetadj);
+		w_psidk = sqrt(ball_k->v_x*ball_k->v_x + ball_k->v_y*ball_k->v_y)*exp(-mu*(tick-ball_k->tick_base+c))*(sin_thetadk*sin_phi+cos_phi*cos_thetadk);
+	}
 	//////////////////////////
 	ball_j->v_x = w_psidj*cos_phi - w_etadj*sin_phi;
 	ball_j->v_y = w_psidj*sin_phi + w_etadj*cos_phi;
 	ball_k->v_x = w_psidk*cos_phi - w_etadk*sin_phi;
 	ball_k->v_y = w_psidk*sin_phi + w_etadk*cos_phi;
 
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+		sin_a = sinus(ball_j->v_x, ball_j->v_y);
+		cos_b = cosinus(ball_k->v_x, ball_k->v_y);
+		sin_b = sinus(ball_k->v_x, ball_k->v_y);
+		v_xj = ball_j->v_x;
+		v_xk = ball_k->v_x;
+		v_yj = ball_j->v_y;
+		v_yk = ball_k->v_y;
+		mu_xj = params->mu*cos_a;
+		mu_xk = params->mu*cos_b;
+		mu_yj = params->mu*sin_a;
+		mu_yk = params->mu*sin_b;
+	}
+	else{
+		v_xj = ball_j->v_x;
+		v_xk = ball_k->v_x;
+		v_yj = ball_j->v_y;
+		v_yk = ball_k->v_y;
+	}
 	// 10)
 	ball_j->tick_base = tick + c;
 	ball_k->tick_base = tick + c;
 	// 11)
-	ball_j->x = xdj + movement_integral(ball_j->v_x, mu, delta_t-c, 0);
-	ball_j->y = ydj + movement_integral(ball_j->v_y, mu, delta_t-c, 0);
-	ball_k->x = xdk + movement_integral(ball_k->v_x, mu, delta_t-c, 0);
-	ball_k->y = ydk + movement_integral(ball_k->v_y, mu, delta_t-c, 0);
+	ball_j->x = xdj + movement_integral(v_xj, mu_xj, delta_t-c, 0, params->motion_mode);
+	ball_j->y = ydj + movement_integral(v_yj, mu_yj, delta_t-c, 0, params->motion_mode);
+	ball_k->x = xdk + movement_integral(v_xk, mu_xk, delta_t-c, 0, params->motion_mode);
+	ball_k->y = ydk + movement_integral(v_yk, mu_yk, delta_t-c, 0, params->motion_mode);
 	if((ball_j->x-ball_k->x)*(ball_j->x-ball_k->x)+(ball_j->y-ball_k->y)*(ball_j->y-ball_k->y) <= 4*R*R){
 		printf("nie spełnia=%lf\n", (ball_j->x-ball_k->x)*(ball_j->x-ball_k->x)+(ball_j->y-ball_k->y)*(ball_j->y-ball_k->y));
 	}
@@ -264,20 +579,79 @@ __device__ void putting_out(struct Ball balls[], double mu, double tick, int id)
 	balls[id].y += dy;
 }
 
+__device__ double ud_putting_out(struct Ball balls[], struct Params *params, int putting_out_id, double tick){
+	double cos_ap = balls[putting_out_id].v_x / sqrt(balls[putting_out_id].v_x*balls[putting_out_id].v_x + balls[putting_out_id].v_y*balls[putting_out_id].v_y);
+	double v_xp = balls[putting_out_id].v_x - params->mu*cos_ap*(tick - balls[putting_out_id].tick_base);
+	double t = v_xp/(params->mu*cos_ap);
+	for (int i = 0; i < params->n; ++i){
+		balls[i].x_0 = balls[i].x;
+		balls[i].y_0 = balls[i].y;
+		double dx, dy;
+		double v_x, v_y;
+		double mu_x, mu_y;
+		double sin_a = sinus(balls[i].v_x, balls[i].v_y);
+		double cos_a = cosinus(balls[i].v_x, balls[i].v_y);
+		mu_x = params->mu*cos_a;
+		mu_y = params->mu*sin_a;
+		v_x = balls[i].v_x - params->mu*cos_a*(tick - balls[i].tick_base);
+		v_y = balls[i].v_y - params->mu*sin_a*(tick - balls[i].tick_base);
+		dx = movement_integral(v_x, mu_x, tick-balls[i].tick_base+t, tick-balls[i].tick_base, params->motion_mode);
+		dy = movement_integral(v_y, mu_y, tick-balls[i].tick_base+t, tick-balls[i].tick_base, params->motion_mode);
+		balls[i].x += dx;
+		balls[i].y += dy;
+	}
+	balls[putting_out_id].v_x = 0.0;
+	balls[putting_out_id].v_y = 0.0;
+	return t;
+}
+
 __device__ double border_shortcut(struct Ball *ball_j, struct Params *params, double q0, double border, double tick, char mode){
+	if(ball_j->v_x == 0.0 && ball_j->v_y == 0.0) return nan("1");
 	double v0q;
-	if(mode == 'v') v0q = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
-	else v0q = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
+	double func;
+	double v_x, v_y;
+	double mu_x, mu_y;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+		double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+		v_x = ball_j->v_x - params->mu*cos_a*(tick - ball_j->tick_base);
+		v_y = ball_j->v_y - params->mu*sin_a*(tick - ball_j->tick_base);
+		if(mode == 'v'){
+			v0q = ball_j->v_y - sin_a*params->mu*(tick - ball_j->tick_base);
+			func = sin_a;
+		}
+		else{
+			v0q = ball_j->v_x - cos_a*params->mu*(tick - ball_j->tick_base);
+			func = cos_a;
+		}
+		mu_x = params->mu*cos_a;
+		mu_y = params->mu*sin_a;
+	}
+	else{
+		if(mode == 'v') v0q = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
+		else v0q = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
+		v_x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
+		v_y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
+		mu_x = params->mu;
+		mu_y = params->mu;
+	}
 	double t;
-	if(params->mu == 0.0) t = (border - q0) / v0q;
-	else t = -1/params->mu*log(1 - params->mu/v0q*(border - q0));
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		t = solve_quadratic(-func/2*params->mu, v0q, q0 - border);
+	}
+	else{
+		if(params->mu == 0.0) t = (border - q0) / v0q;
+		else t = -1/params->mu*log(1 - params->mu/v0q*(border - q0));
+	}
 	if(mode == 'v'){
-		double x1 = ball_j->x + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+t, tick-ball_j->tick_base);
+		double x1;
+		x1 = ball_j->x + movement_integral(v_x, mu_x, tick-ball_j->tick_base+t, tick-ball_j->tick_base, params->motion_mode);
 		if(x1 < params->left_border + params->l/sqrt(2.0) || (x1 > (params->right_border + params->left_border)/2-params->l/2 && 
 			x1 < (params->right_border + params->left_border)/2+params->l/2) || x1 > params->right_border - params->l/sqrt(2.0)) return nan("1");
 	}
 	else{
-		double y1 = ball_j->y + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+t, tick-ball_j->tick_base);
+		double y1;
+		y1 = ball_j->y + movement_integral(v_y, mu_y, tick-ball_j->tick_base+t, tick-ball_j->tick_base, params->motion_mode);
 		if(y1 < params->top_border + params->l/sqrt(2.0) || y1 > params->bottom_border - params->l/sqrt(2.0)) return nan("1");
 	}
 	if(t >= 0){
@@ -299,8 +673,25 @@ __device__ double find_border_crossing(double p, double q, double R, double bord
 
 
 __device__ bool check_border_crossing(struct Ball *ball_j, struct Params *params, double tick, double x_co, double y_co, double t){
-	double x_p = ball_j->x + movement_integral(ball_j->v_x, params->mu, tick-ball_j->tick_base+t, tick-ball_j->tick_base);
-	double y_p = ball_j->y + movement_integral(ball_j->v_y, params->mu, tick-ball_j->tick_base+t, tick-ball_j->tick_base);
+	double x_p, y_p;
+	double v_x, v_y;
+	double mu_x, mu_y;
+	double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+	double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		mu_x = params->mu*cos_a;
+		mu_y = params->mu*sin_a;
+		v_x = ball_j->v_x - params->mu*cos_a*(tick - ball_j->tick_base);
+		v_y = ball_j->v_y - params->mu*sin_a*(tick - ball_j->tick_base);
+	}
+	else{
+		mu_x = params->mu;
+		mu_y = params->mu;
+		v_x = ball_j->v_x;
+		v_y = ball_j->v_y;
+	}
+	x_p = ball_j->x + movement_integral(v_x, mu_x, tick-ball_j->tick_base+t, tick-ball_j->tick_base, params->motion_mode);
+	y_p = ball_j->y + movement_integral(v_y, mu_y, tick-ball_j->tick_base+t, tick-ball_j->tick_base, params->motion_mode);
 	bool border_crossing = false;
 	int top_border = params->top_border;
 	int bottom_border = params->bottom_border;
@@ -337,95 +728,165 @@ __device__ bool check_border_crossing(struct Ball *ball_j, struct Params *params
 
 
 __device__ double corner_shortcut(struct Ball *ball_j, struct Params *params, double tick, double x_co, double y_co){
-	if(params->mu == 0.0){
+	if(ball_j->v_x == 0.0 && ball_j->v_y == 0.0) return nan("1");
+	double t;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		double v_x, v_y;
+		double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+		double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
 		double x_p = ball_j->x - x_co;
 		double y_p = ball_j->y - y_co;
-		double A = ball_j->v_x*ball_j->v_x + ball_j->v_y*ball_j->v_y;
-		double B = 2*(ball_j->v_x*x_p + ball_j->v_y*y_p);
-		double C = x_p*x_p + y_p*y_p - params->R*params->R;
-		double delta = B*B - 4*A*C;
-		if(delta < 0) return nan("1");
-		double t = (-B - sqrt(delta))/2/A;
-		bool border_crossing = check_border_crossing(ball_j, params, tick, x_co, y_co, t);
-		if(!border_crossing && !isnan(t) && t > 0){
-			ball_j->corner_available = true;
-			ball_j->x_corner = x_co;
-			ball_j->y_corner = y_co;
-			return t;
-		}
-		else return nan("1");
+		v_x = ball_j->v_x - params->mu*cos_a*(tick - ball_j->tick_base);
+		v_y = ball_j->v_y - params->mu*sin_a*(tick - ball_j->tick_base);
+		double A = params->mu*params->mu/4;
+		double B = -params->mu*(v_x*cos_a + v_y*sin_a);
+		double C = v_x*v_x + v_y*v_y - params->mu * (x_p*cos_a + y_p*sin_a);
+		double D = 2*(x_p*v_x + y_p*v_y);
+		double E = x_p*x_p + y_p*y_p - params->R*params->R;
+		B /= A;
+		C /= A;
+		D /= A;
+		E /= A;
+		t = solve_quartic(B, C, D, E);	
 	}
 	else{
-		double v_x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
-		double v_y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
-		double x_p = ball_j->x + v_x/params->mu - x_co;
-		double y_p = ball_j->y + v_y/params->mu - y_co;
-		double A = (v_x*v_x + v_y*v_y)/params->mu/params->mu;
-		double B = -2*(x_p*v_x + y_p*v_y)/params->mu;
-		double C = x_p*x_p + y_p*y_p - params->R*params->R;
-		double delta = B*B - 4*A*C;
-		if(delta < 0) return nan("1");
-		double g = (-B + sqrt(delta)) / 2 / A;
-		double t = -1/params->mu*log(g);
-		bool border_crossing = check_border_crossing(ball_j, params, tick, x_co, y_co, t);
-		if(!border_crossing && !isnan(t) && t > 0){
-			ball_j->corner_available = true;
-			ball_j->x_corner = x_co;
-			ball_j->y_corner = y_co;
-			return t;
+		if(params->mu == 0.0){
+			double x_p = ball_j->x - x_co;
+			double y_p = ball_j->y - y_co;
+			double A = ball_j->v_x*ball_j->v_x + ball_j->v_y*ball_j->v_y;
+			double B = 2*(ball_j->v_x*x_p + ball_j->v_y*y_p);
+			double C = x_p*x_p + y_p*y_p - params->R*params->R;
+			double delta = B*B - 4*A*C;
+			if(delta < 0) return nan("1");
+			double t = (-B - sqrt(delta))/2/A;
 		}
-		else return nan("1");
+		else{
+			double v_x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
+			double v_y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
+			double x_p = ball_j->x + v_x/params->mu - x_co;
+			double y_p = ball_j->y + v_y/params->mu - y_co;
+			double A = (v_x*v_x + v_y*v_y)/params->mu/params->mu;
+			double B = -2*(x_p*v_x + y_p*v_y)/params->mu;
+			double C = x_p*x_p + y_p*y_p - params->R*params->R;
+			double delta = B*B - 4*A*C;
+			if(delta < 0) return nan("1");
+			double g = (-B + sqrt(delta)) / 2 / A;
+			t = -1/params->mu*log(g);
+		}
 	}
+	bool border_crossing = check_border_crossing(ball_j, params, tick, x_co, y_co, t);
+	if(!border_crossing && !isnan(t) && t > 0){
+		ball_j->corner_available = true;
+		ball_j->x_corner = x_co;
+		ball_j->y_corner = y_co;
+	}
+	else return nan("1");
+	return t;
 }
 
 
-__device__ double balls_shortcut(struct Params *params, double x_10, double y_10, double v_1x, double v_1y, double x_20, double y_20, double v_2x, double v_2y){
-	double dx = x_10 - x_20;
-	double dy = y_10 - y_20;
-	if(params->mu == 0.0){
-		double dvx = v_1x - v_2x;
-		double dvy = v_1y - v_2y;
-		double A = dvx*dvx + dvy*dvy;
-		double B = 2*(dx*dvx + dy*dvy);
-		double C = dx*dx + dy*dy - 4*params->R*params->R;
-		double delta = B*B - 4*A*C;
-		if(delta < 0) return nan("1");
-		double t = (-B - sqrt(delta))/2/A;
-		if(t >= 0){
-			return t;
-		}
-		else return nan("1");
+__device__ double balls_shortcut(struct Ball *ball_i, struct Ball *ball_j, struct Params *params, double tick){
+	double x_10, y_10, v_1x, v_1y, x_20, y_20, v_2x, v_2y;
+	double sin_a, cos_a, sin_b, cos_b;
+	double t;
+	x_10 = ball_i->x;
+	x_20 = ball_j->x;
+	y_10 = ball_i->y;
+	y_20 = ball_j->y;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		cos_a = cosinus(ball_i->v_x, ball_i->v_y);
+		sin_a = sinus(ball_i->v_x, ball_i->v_y);
+		cos_b = cosinus(ball_j->v_x, ball_j->v_y);
+		sin_b = sinus(ball_j->v_x, ball_j->v_y);
+		v_1x = ball_i->v_x - cos_a*params->mu*(tick - ball_i->tick_base);
+		v_1y = ball_i->v_y - sin_a*params->mu*(tick - ball_i->tick_base);
+		v_2x = ball_j->v_x - cos_b*params->mu*(tick - ball_j->tick_base);
+		v_2y = ball_j->v_y - sin_b*params->mu*(tick - ball_j->tick_base);
 	}
 	else{
-		double dvx = 1/params->mu*(v_1x - v_2x);
-		double dvy = 1/params->mu*(v_1y - v_2y);
-		double alpha = dx + dvx;
-		double beta = dy + dvy;
-		double C = alpha*alpha + beta*beta - 4*params->R*params->R;
-		double B = -2*(alpha*dvx + beta*dvy);
-		double A = dvx*dvx + dvy*dvy;
-		double delta = B*B - 4*A*C;
-		if(delta < 0) return nan("1");
-		double t = -log(-(B-sqrt(delta))/2/A)/params->mu;
-		if(t >= 0){
-			return t;
-		}
-		else return nan("1");
+		v_1x = ball_i->v_x*exp(-params->mu*(tick - ball_i->tick_base));
+		v_1y = ball_i->v_y*exp(-params->mu*(tick - ball_i->tick_base));
+		v_2x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
+		v_2y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
 	}
+	if(v_1x == 0.0 && v_1y == 0.0 && v_2x == 0.0 && v_2y == 0.0) return nan("1");
+	double dx = x_10 - x_20;
+	double dy = y_10 - y_20;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		double u_dx = params->mu/2*(cos_b - cos_a);
+		double u_dy = params->mu/2*(sin_b - sin_a);
+		double dvx = v_1x - v_2x;
+		double dvy = v_1y - v_2y;
+		double A = u_dx*u_dx + u_dy*u_dy;
+		double B = 2*(u_dx*dvx + u_dy*dvy);
+		double C = dvx*dvx + dvy*dvy + 2*u_dx*dx + 2*u_dy*dy;
+		double D = 2*(dx*dvx + dy*dvy);
+		double E = dx*dx + dy*dy - 4*params->R*params->R;
+		B /= A;
+		C /= A;
+		D /= A;
+		E /= A;
+		t = solve_quartic(B, C, D, E);
+	}
+	else{
+		if(params->mu == 0.0){
+			double dvx = v_1x - v_2x;
+			double dvy = v_1y - v_2y;
+			double A = dvx*dvx + dvy*dvy;
+			double B = 2*(dx*dvx + dy*dvy);
+			double C = dx*dx + dy*dy - 4*params->R*params->R;
+			double delta = B*B - 4*A*C;
+			if(delta < 0) return nan("1");
+			t = (-B - sqrt(delta))/2/A;
+			
+		}
+		else{
+			double dvx = 1/params->mu*(v_1x - v_2x);
+			double dvy = 1/params->mu*(v_1y - v_2y);
+			double alpha = dx + dvx;
+			double beta = dy + dvy;
+			double C = alpha*alpha + beta*beta - 4*params->R*params->R;
+			double B = -2*(alpha*dvx + beta*dvy);
+			double A = dvx*dvx + dvy*dvy;
+			double delta = B*B - 4*A*C;
+			if(delta < 0) return nan("1");
+			t = -log(-(B-sqrt(delta))/2/A)/params->mu;
+		}
+	}
+	if(t >= 0){
+		return t;
+	}
+	else return nan("1");
 }
 
 
 __device__ double pocket_shortcut(double g, double b, double xc, struct Ball *ball_j, struct Params *params, double tick){
-	double v_x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
-	double v_y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
-	double x3 = (ball_j->y-v_y/v_x*ball_j->x - b) / (g - v_y/v_x);
-	double x1 = (ball_j->y-params->R*sqrt(1+(v_y/v_x)*(v_y/v_x))-v_y/v_x*ball_j->x - b) / (g - v_y/v_x);
-	double x2 = (ball_j->y+params->R*sqrt(1+(v_y/v_x)*(v_y/v_x))-v_y/v_x*ball_j->x - b) / (g - v_y/v_x);
+	if(ball_j->v_x == 0.0 && ball_j->v_y == 0.0) return nan("1");
+	double v_x, v_y, tg;
+	double sin_a = sinus(ball_j->v_x, ball_j->v_y);
+	double cos_a = cosinus(ball_j->v_x, ball_j->v_y);
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		v_x = ball_j->v_x - cos_a*params->mu*(tick - ball_j->tick_base);
+		v_y = ball_j->v_y - sin_a*params->mu*(tick - ball_j->tick_base);
+		tg = ball_j->v_y / ball_j->v_x;
+	}
+	else{
+		v_x = ball_j->v_x*exp(-params->mu*(tick - ball_j->tick_base));
+		v_y = ball_j->v_y*exp(-params->mu*(tick - ball_j->tick_base));
+		tg = v_y / v_x;
+	}
+	double x3 = (ball_j->y-tg*ball_j->x - b) / (g - tg);
+	double x1 = (ball_j->y-params->R*sqrt(1+tg*tg)-tg*ball_j->x - b) / (g - tg);
+	double x2 = (ball_j->y+params->R*sqrt(1+tg*tg)-tg*ball_j->x - b) / (g - tg);
 	
 	if(((1+g*g)*(x1 - xc)*(x1 - xc) <= params->l*params->l/4) && ((1+g*g)*(x2 - xc)*(x2 - xc) <= params->l*params->l/4)){
 		double t;
-		if(params->mu == 0.0) t = (x3 - ball_j->x) / v_x;
-		else t = -log(1 - params->mu*(x3 - ball_j->x)/(v_x))/params->mu;
+		if(params->motion_mode == UNIFORMLY_DECELERATED)
+			t = solve_quadratic(-cos_a/2*params->mu, v_x, ball_j->x - x3);
+		else{
+			if(params->mu == 0.0) t = (x3 - ball_j->x) / v_x;
+			else t = -log(1 - params->mu*(x3 - ball_j->x)/(v_x))/params->mu;
+		}
 		if(isnan(t)) return nan("1");
 		if(t >= 0){
 			ball_j->pocket_available = true;
@@ -543,12 +1004,17 @@ __device__ void shortcut_step_part1(struct Ball balls[], struct Params *params, 
 	double lowest0 = autonomical_lowest(&balls[id], params, tick, &pocket_is_lowest_a);
 	lowest = find_lowest(lowest0, lowest, &pocket_is_lowest, pocket_is_lowest_a);		
 	for (int j = id+1; j < params->n; ++j){
-		lowest = find_lowest_m(floor(balls_shortcut(params, balls[id].x, balls[id].y, balls[id].v_x*exp(-params->mu*(tick - balls[id].tick_base)), 
-				balls[id].v_y*exp(-params->mu*(tick - balls[id].tick_base)), balls[j].x, balls[j].y, balls[j].v_x*exp(-params->mu*(tick - balls[j].tick_base)), 
-				balls[j].v_y*exp(-params->mu*(tick - balls[j].tick_base))) / params->delta_t), lowest, &pocket_is_lowest, COLLISION, &balls[id]);
+		lowest = find_lowest_m(floor(balls_shortcut(&balls[id], &balls[j], params, tick) / params->delta_t), lowest, &pocket_is_lowest, COLLISION, &balls[id]);
 	}
 	lowests[id] = lowest;
 	pockets[id] = pocket_is_lowest;
+}
+
+__device__ void shortcut_step_part1d5(struct Ball balls[], struct Params *params, int id, double lowest, double tick, double *min_putting_times){
+	double cos_a = balls[id].v_x / sqrt(balls[id].v_x*balls[id].v_x + balls[id].v_y*balls[id].v_y);
+	double v_x = balls[id].v_x - params->mu*cos_a*(tick - balls[id].tick_base);
+	if(is_lower(floor(v_x/(params->mu*cos_a)/params->delta_t), lowest))	min_putting_times[id] = v_x/(params->mu*cos_a);
+	else min_putting_times[id] = nan("1");
 }
 
 __device__ double shortcut_step_part2(struct Ball balls[], struct Params *params, int id, double lowest, bool pocket_is_lowest, double tick, enum State *state){
@@ -560,14 +1026,31 @@ __device__ double shortcut_step_part2(struct Ball balls[], struct Params *params
 	if(!isnan(lowest)){
 		balls[id].x_0 = balls[id].x;
 		balls[id].y_0 = balls[id].y;
-		double dx = movement_integral(balls[id].v_x, params->mu, tick-balls[id].tick_base+lowest*params->delta_t, tick-balls[id].tick_base);
-		double dy = movement_integral(balls[id].v_y, params->mu, tick-balls[id].tick_base+lowest*params->delta_t, tick-balls[id].tick_base);
+		double dx, dy;
+		double v_x, v_y;
+		double mu_x, mu_y;
+		if(params->motion_mode == UNIFORMLY_DECELERATED){
+			double sin_a = sinus(balls[id].v_x, balls[id].v_y);
+			double cos_a = cosinus(balls[id].v_x, balls[id].v_y);
+			mu_x = params->mu*cos_a;
+			mu_y = params->mu*sin_a;
+			v_x = balls[id].v_x - params->mu*cos_a*(tick - balls[id].tick_base);
+			v_y = balls[id].v_y - params->mu*sin_a*(tick - balls[id].tick_base);
+		}
+		else{
+			mu_x = params->mu;
+			mu_y = params->mu;
+			v_x = balls[id].v_x;
+			v_y = balls[id].v_y;
+		}
+		dx = movement_integral(v_x, mu_x, tick-balls[id].tick_base+lowest*params->delta_t, tick-balls[id].tick_base, params->motion_mode);
+		dy = movement_integral(v_y, mu_y, tick-balls[id].tick_base+lowest*params->delta_t, tick-balls[id].tick_base, params->motion_mode);
 		balls[id].x += dx;
 		balls[id].y += dy;
 	}
 	else{
-		if(params->mu > 0){
-			putting_out(balls, params->mu, tick, id);
+		if(params->mu > 0 && params->motion_mode == PROPORTIONAL_TO_VELOCITY){
+			putting_out(balls, params->n, params->mu, tick);
 		}
 	}
 	return lowest;
@@ -576,8 +1059,25 @@ __device__ double shortcut_step_part2(struct Ball balls[], struct Params *params
 __device__ void mechanics_step(struct Ball balls[], struct Params *params, int id, double tick){
 	balls[id].x_0 = balls[id].x;
 	balls[id].y_0 = balls[id].y;
-	double dx = movement_integral(balls[id].v_x, params->mu, tick-balls[id].tick_base+params->delta_t, tick-balls[id].tick_base);
-	double dy = movement_integral(balls[id].v_y, params->mu, tick-balls[id].tick_base+params->delta_t, tick-balls[id].tick_base);
+	double dx, dy;
+	double v_x, v_y;
+	double mu_x, mu_y;
+	if(params->motion_mode == UNIFORMLY_DECELERATED){
+		double sin_a = sinus(balls[id].v_x, balls[id].v_y);
+		double cos_a = cosinus(balls[id].v_x, balls[id].v_y);
+		mu_x = params->mu*cos_a;
+		mu_y = params->mu*sin_a;
+		v_x = balls[id].v_x - params->mu*cos_a*(tick - balls[id].tick_base);
+		v_y = balls[id].v_y - params->mu*sin_a*(tick - balls[id].tick_base);
+	}
+	else{
+		mu_x = params->mu;
+		mu_y = params->mu;
+		v_x = balls[id].v_x;
+		v_y = balls[id].v_y;
+	}
+	dx = movement_integral(v_x, mu_x, tick-balls[id].tick_base+params->delta_t, tick-balls[id].tick_base, params->motion_mode);
+	dy = movement_integral(v_y, mu_y, tick-balls[id].tick_base+params->delta_t, tick-balls[id].tick_base, params->motion_mode);
 	balls[id].x += dx;
 	balls[id].y += dy;
 	double v = sqrt(balls[id].v_x*balls[id].v_x+balls[id].v_y*balls[id].v_y);

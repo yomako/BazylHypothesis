@@ -32,6 +32,8 @@ __global__ void kernel(BallsSet *balls_from_host, int *results){
 		__shared__ double lowest;
 		__shared__ bool pocket_is_lowest;
 		__shared__ bool pockets[N];
+		__shared__ double min_putting_time;
+		__shared__ double putting_out_id;
 		shortcut_step_part1(balls, &params, ball_id, tick, &state, lowests, pockets);
 		if(ball_id == 0){
 			lowest = nan("1");
@@ -47,6 +49,25 @@ __global__ void kernel(BallsSet *balls_from_host, int *results){
 			pocket_is_lowest = pockets[lowest_id];
 		}
 		__syncthreads();
+		if(params.motion_mode == UNIFORMLY_DECELERATED){
+			__shared__ double min_putting_times[N];
+			shortcut_step_part1d5(balls, &params, ball_id, lowest, tick, min_putting_times);
+			if(ball_id == 0){
+				min_putting_time = nan("1");
+				putting_out_id = -1;
+				for(int i = 0; i < N; i++){
+					if(is_lower(min_putting_times[i], min_putting_time)){
+						min_putting_time = min_putting_times[i];
+						putting_out_id = i;
+					}
+				}
+			}
+		}
+		__syncthreads();
+		if(params.motion_mode == UNIFORMLY_DECELERATED && putting_out_id != -1){
+			tick += ud_putting_out(balls, &params, putting_out_id, tick);
+			continue;
+		}
 		tick += shortcut_step_part2(balls, &params, ball_id, lowest, pocket_is_lowest, tick, &state) * params.delta_t;
 		if(ball_id == 0){
 			if(isnan(tick)) state = check_table(balls, &params, tick);
@@ -65,6 +86,7 @@ __global__ void kernel(BallsSet *balls_from_host, int *results){
 		}
 		__syncthreads();
 	}
+	printf("%d\n", *results);
 }
 
 int main( void ) {
@@ -90,6 +112,8 @@ int main( void ) {
 	pParams.delta_t = 0.001;
 	pParams.v_max = 0.4*sqrt(2);
 	pParams.n = N;
+	pParams.motion_mode = PROPORTIONAL_TO_VELOCITY;
+	//pParams.motion_mode = UNIFORMLY_DECELERATED;
 
 	Ball balls[REPEATS][N];
 	BallsSet pBallsset;
@@ -106,7 +130,6 @@ int main( void ) {
 	for(int i=0; i < REPEATS; i++){
 		memcpy(pBallsset.balls[i], balls[i], N * sizeof (Ball));
 	}
-	printf("size=%lu, %lu\n", sizeof(Ball), SIZE_MAX);
 	HANDLE_ERROR( cudaMalloc( (void**)&ballsset, sizeof(BallsSet) ) );
 	HANDLE_ERROR( cudaMalloc( (void**)&results, sizeof(int) ) );
 	HANDLE_ERROR( cudaMemcpy( ballsset, &pBallsset, sizeof(BallsSet), cudaMemcpyHostToDevice ) );
